@@ -1,0 +1,792 @@
+# 장값 — 쓱닷컴·그린빈즈 간장·된장 일일 가격·행사 수집 (설치 파일 하나로 전부 동작)
+# 이 파일 하나에 수집기와 앱 코드가 모두 들어 있습니다. 매일 06:00 KST에 자동 실행됩니다.
+name: jangprice
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Write app and crawler files
+        run: |
+          mkdir -p crawler
+          cat > crawler/config.py <<'JANGPRICE_EOF'
+          """수집 대상 설정. 카테고리 URL이나 제외 키워드를 바꿀 때는 이 파일만 고치면 됩니다."""
+
+          # 쓱닷컴(SSG.COM) — 입점 판매자 포함 전체. dispCtgId는 SSG.COM 통합 카테고리 기준.
+          SSG_CATEGORIES = [
+              {"category": "간장", "url": "https://www.ssg.com/disp/category.ssg?dispCtgId=6000094155"},
+              {"category": "된장", "url": "https://www.ssg.com/disp/category.ssg?dispCtgId=6000094158"},
+          ]
+          SSG_MAX_PAGES = 30          # 카테고리당 최대 페이지 수(안전장치)
+
+          # 그린빈즈(Green Beans) — 醤油는 확인된 카테고리 ID. 味噌는 실행 시 調味料 페이지에서 자동으로 찾습니다.
+          GB_SEASONING_URL = "https://greenbeans.com/products?sublocationId=ef1ddf69-5b76-4517-af6e-fab962b24008"
+          GB_CATEGORIES = [
+              {"category": "간장", "url": "https://greenbeans.com/products?sublocationId=3dad5512-397a-43d1-b786-bf3ea92204a6"},
+              # 味噌 카테고리 URL을 알게 되면 아래처럼 직접 적어 두면 자동 탐색을 건너뜁니다.
+              # {"category": "된장", "url": "https://greenbeans.com/products?sublocationId=..."},
+          ]
+          GB_MISO_LINK_TEXTS = ["味噌", "みそ"]
+
+          # 카테고리에 섞여 들어오는 비대상 상품. 삭제하지 않고 excluded로 표시해 대시보드에서 숨깁니다.
+          # (조사 기준: 醤油·味噌만. だし醤油·白だし는 간장에 포함, つゆ·ぽん酢·みりん·酢 등은 제외)
+          EXCLUDE_KEYWORDS = [
+              "シャンタン", "ぽん酢", "ポン酢", "めんつゆ", "本つゆ", "みりん", "ドレッシング",
+              "쯔유", "폰즈", "고추장", "춘장", "액젓", "드레싱",
+          ]
+
+          # 요청 간격(초). 사이트 부담을 줄이기 위해 페이지마다 쉽니다.
+          REQUEST_DELAY_SEC = 4
+
+          # 가격 이력 보관 일수
+          HISTORY_DAYS = 400
+          JANGPRICE_EOF
+          mkdir -p crawler
+          cat > crawler/parsers.py <<'JANGPRICE_EOF'
+          """상품 카드 텍스트 → 구조화 데이터. 네트워크 없이 테스트할 수 있도록 순수 함수로 분리."""
+          import re
+
+          from config import EXCLUDE_KEYWORDS
+
+
+          def _num(s):
+              return int(s.replace(",", "").replace("，", "")) if s else None
+
+
+          def _z2h(s):
+              """전각 숫자 → 반각."""
+              return s.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+          def is_excluded(name):
+              for kw in EXCLUDE_KEYWORDS:
+                  if kw in name:
+                      return kw
+              return None
+
+
+          # ── 그린빈즈 ──────────────────────────────────────────────
+          GB_FLAG_WORDS = ["セール", "新商品", "値下げ", "特価", "オーガニック/有機", "数量限定", "期間限定"]
+
+
+          def parse_gb(text, title=""):
+              t = _z2h(text)
+              out = {"currency": "JPY", "promos": [], "tags": []}
+
+              m = re.search(r"価格\s*[¥￥]\s*([\d,]+)\s*税込\s*[¥￥]\s*([\d,]+)", t)
+              if m:
+                  out["price_ex_tax"] = _num(m.group(1))
+                  out["price"] = _num(m.group(2))          # 기준가 = 세금 포함
+              else:
+                  m = re.search(r"税込\s*[¥￥]\s*([\d,]+)", t)
+                  out["price"] = _num(m.group(1)) if m else None
+
+              m = re.search(r"([\d.,]+\s*(?:mL|ml|L|g|kg|食入|個|本))\s*\(\s*[¥￥]\s*([\d,]+)\s*/\s*([\d]+\s*(?:ml|mL|g|食|個))\)", t)
+              if m:
+                  out["size"] = m.group(1).replace(" ", "")
+                  out["unit_price"] = f"¥{m.group(2)}/{m.group(3).replace(' ', '')}"
+
+              for m in re.finditer(r"(\d+)\s*WAON\s*POINT\s*(\d+月\d+日まで)?", t):
+                  out["promos"].append(f"{m.group(1)}WAON POINT" + (f" ({m.group(2)})" if m.group(2) else ""))
+
+              for m in re.finditer(r"(\d+)\s*(?:個|点)以上で.{0,20}?(?:[¥￥]\s*[\d,]+|\d+%\s*OFF|\d+%引)", t):
+                  out["promos"].append(m.group(0).strip())
+
+              for w in GB_FLAG_WORDS:
+                  if w in t:
+                      (out["promos"] if w in ("セール", "値下げ", "特価", "数量限定", "期間限定") else out["tags"]).append(w)
+
+              m = re.search(r"評価は(\d+)件のレビューで5点中([\d.]+)点", t)
+              if m:
+                  out["reviews"] = int(m.group(1))
+                  out["rating"] = float(m.group(2))
+
+              out["promos"] = list(dict.fromkeys(out["promos"]))
+              return out
+
+
+          # ── 쓱닷컴 ───────────────────────────────────────────────
+          SSG_LABELS = ["해외직구", "새벽배송", "주간배송", "스타배송", "쓱배송", "트레이더스", "미식관",
+                        "신세계백화점", "이마트몰", "신세계몰", "인기 BEST", "오반장", "쓱-특가", "쓱특가",
+                        "1+1", "2+1", "무료배송", "쓱7클럽", "신상품"]
+
+
+          def parse_ssg(text, title=""):
+              t = text
+              out = {"currency": "KRW", "promos": [], "tags": []}
+
+              sale = re.search(r"(?:판매가격|최적가)\s*\*?\s*([\d,]+)\s*\*?\s*원", t)
+              regular = re.search(r"정상가격\s*\*?\s*([\d,]+)\s*원", t)
+              top = re.search(r"최고판매가\s*\*?\s*([\d,]+)\s*원", t)
+              out["price"] = _num(sale.group(1)) if sale else None
+              if regular:
+                  out["price_regular"] = _num(regular.group(1))
+              if top:
+                  out["price_top"] = _num(top.group(1))
+
+              m = re.search(r"할인율\s*(\d+)\s*%", t)
+              if m:
+                  out["discount_pct"] = int(m.group(1))
+                  out["promos"].append(f"즉시할인 {m.group(1)}%")
+              elif out.get("price_regular") and out.get("price") and out["price"] < out["price_regular"]:
+                  pct = round((1 - out["price"] / out["price_regular"]) * 100)
+                  out["discount_pct"] = pct
+                  out["promos"].append(f"즉시할인 {pct}%")
+
+              m = re.search(r"(\d+)\s*%\s*카드할인", t)
+              if m:
+                  out["promos"].append(f"카드할인 {m.group(1)}%")
+
+              m = re.search(r"(\d+\s*(?:ml|g|개|L|kg))\s*당\s*:?\s*([\d,]+)\s*원", t)
+              if m:
+                  out["unit_price"] = f"{m.group(2)}원/{m.group(1).replace(' ', '')}"
+
+              m = re.search(r"총 용량\s*:\s*([\d,]+\s*(?:ml|g|개))", t)
+              if m:
+                  out["size"] = m.group(1).replace(" ", "")
+              elif title:
+                  m = re.search(r"(\d+(?:\.\d+)?\s*(?:ml|mL|ML|L|g|kg|KG|리터))", title)
+                  if m:
+                      out["size"] = m.group(1).replace(" ", "")
+
+              m = re.search(r"배송비\s*([\d,]+)\s*원", t)
+              if m:
+                  out["shipping"] = _num(m.group(1))
+
+              for lb in SSG_LABELS:
+                  if lb in t:
+                      (out["promos"] if lb in ("오반장", "쓱-특가", "쓱특가", "1+1", "2+1") else out["tags"]).append(lb)
+
+              m = re.search(r"리뷰 별점\s*([\d.]+)\s*점", t)
+              if m:
+                  out["rating"] = float(m.group(1))
+              m = re.search(r"리뷰\s*(?:갯수|총)\s*([\d,]+)\s*건", t)
+              if m:
+                  out["reviews"] = _num(m.group(1))
+
+              out["promos"] = list(dict.fromkeys(out["promos"]))
+              return out
+
+
+          def ssg_seller(text, title):
+              """카드 첫 줄에 판매자·브랜드명이 오는 경우가 많다(예: '본타몰'). 제목과 같으면 없음."""
+              for line in text.splitlines():
+                  s = line.strip().strip("*")
+                  if not s or s == title or s in SSG_LABELS:
+                      continue
+                  if re.search(r"\d", s) or len(s) > 20:
+                      return None
+                  return s
+              return None
+          JANGPRICE_EOF
+          mkdir -p crawler
+          cat > crawler/test_parsers.py <<'JANGPRICE_EOF'
+          """네트워크 없이 파서만 검사: python crawler/test_parsers.py"""
+          from parsers import parse_gb, parse_ssg, ssg_seller, is_excluded
+
+          gb = """ヤマサ醤油 特選 有機丸大豆の吟選しょうゆ 1L
+          +2ヵ月賞味・消費期限保証：2ヵ月
+          (7)
+          評価は7件のレビューで5点中5.0点。
+          ヤマサ醤油 特選 有機丸大豆の吟選しょうゆ 1L
+          35WAONPOINT 10月31日まで ここをクリック
+          1L(¥35/100ml)
+          価格¥348税込¥376
+          カートに追加する"""
+          r = parse_gb(gb)
+          print(r)
+          assert r["price"] == 376 and r["price_ex_tax"] == 348 and r["size"] == "1L"
+          assert r["promos"] == ["35WAON POINT (10月31日まで)"] and r["reviews"] == 7
+
+          gb2 = """キッコーマン サクサクしょうゆ 90g
+          +6ヵ月賞味・消費期限保証：6ヵ月新商品新商品
+          90g(¥39/10g)
+          価格¥348税込¥376"""
+          r = parse_gb(gb2); print(r)
+          assert r["price"] == 376 and "新商品" in r["tags"] and r["unit_price"] == "¥39/10g"
+
+          ssg = """*본타몰*
+          일본 미소 된장 마루코메 모음 미소 된장국 일본식품
+          정상가격6,150원
+          할인율5%판매가격5,810원
+          리뷰 별점3.0점 (리뷰 갯수2건)
+          배송비 3,000원·조건부"""
+          r = parse_ssg(ssg, "일본 미소 된장 마루코메 모음 미소 된장국 일본식품"); print(r)
+          assert r["price"] == 5810 and r["price_regular"] == 6150 and r["discount_pct"] == 5 and r["shipping"] == 3000
+          print("seller:", ssg_seller(ssg, "일본 미소 된장 마루코메 모음 미소 된장국 일본식품"))
+
+          ssg2 = """기꼬만 간장 1L
+          미식관
+          주간배송
+          판매가격7,990원
+          3% 카드할인
+          100ml당 799원
+          리뷰 별점4.9점"""
+          r = parse_ssg(ssg2, "기꼬만 간장 1L"); print(r)
+          assert r["price"] == 7990 and "카드할인 3%" in r["promos"] and r["size"] == "1L"
+          assert is_excluded("創味食品 創味シャンタン DELUXE 500g") and not is_excluded("キッコーマン こいくちしょうゆ 1L")
+          print("ALL OK")
+          JANGPRICE_EOF
+          mkdir -p crawler
+          cat > crawler/crawl.py <<'JANGPRICE_EOF'
+          """쓱닷컴·그린빈즈 간장·된장 전 상품 일일 수집기.
+
+          실행: python crawler/crawl.py            (결과: docs/data/)
+          디버그: python crawler/crawl.py --debug  (페이지 HTML·스크린샷을 debug/에 저장)
+          """
+          import asyncio
+          import json
+          import re
+          import sys
+          import time
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          from playwright.async_api import async_playwright
+
+          import config
+          from parsers import is_excluded, parse_gb, parse_ssg, ssg_seller
+
+          ROOT = Path(__file__).resolve().parent.parent
+          DATA = ROOT / "docs" / "data"
+          DEBUG_DIR = ROOT / "debug"
+          KST = timezone(timedelta(hours=9))
+          DEBUG = "--debug" in sys.argv
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+          # 페이지 안에서 실행: 상품 링크마다 '그 상품 하나만 담고 가격이 보이는 가장 큰 상자'를 카드로 잡는다.
+          # 사이트 CSS 클래스명에 의존하지 않아 디자인이 바뀌어도 잘 깨지지 않는다.
+          EXTRACT_JS = r"""
+          (pattern) => {
+            const re = new RegExp(pattern);
+            const idOf = a => { const m = (a.href || '').match(re); return m ? m[1] : null; };
+            const priceRe = /[¥￥]\s?\d|\d[\d,]*\s*원/;
+            const out = [], seen = new Set();
+            for (const a of document.querySelectorAll('a[href]')) {
+              const id = idOf(a);
+              if (!id || seen.has(id)) continue;
+              let el = a, card = null;
+              for (let i = 0; i < 10 && el.parentElement; i++) {
+                el = el.parentElement;
+                const ids = new Set([...el.querySelectorAll('a[href]')].map(idOf).filter(Boolean));
+                if (ids.size > 1) break;
+                if (priceRe.test(el.innerText || '')) card = el;
+              }
+              if (!card) continue;
+              seen.add(id);
+              let title = '';
+              for (const x of card.querySelectorAll('a[href]')) {
+                if (idOf(x) !== id) continue;
+                const t = (x.innerText || x.getAttribute('title') || x.getAttribute('aria-label') || '').trim();
+                if (t.length > title.length) title = t;
+              }
+              if (!title) { const img = card.querySelector('img[alt]'); if (img) title = img.alt.trim(); }
+              out.push({ id, href: a.href.split('#')[0], title: title.split('\n')[0].trim(), text: card.innerText });
+            }
+            return out;
+          }
+          """
+
+
+          def log(*a):
+              print(datetime.now(KST).strftime("%H:%M:%S"), *a, flush=True)
+
+
+          async def save_debug(page, name):
+              if not DEBUG:
+                  return
+              DEBUG_DIR.mkdir(exist_ok=True)
+              (DEBUG_DIR / f"{name}.html").write_text(await page.content(), encoding="utf-8")
+              await page.screenshot(path=str(DEBUG_DIR / f"{name}.png"), full_page=True)
+
+
+          async def goto(page, url):
+              await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+              try:
+                  await page.wait_for_load_state("networkidle", timeout=15000)
+              except Exception:
+                  pass
+              await asyncio.sleep(config.REQUEST_DELAY_SEC)
+
+
+          # ── 쓱닷컴 ───────────────────────────────────────────────
+          async def crawl_ssg(page):
+              items = {}
+              for cat in config.SSG_CATEGORIES:
+                  for pno in range(1, config.SSG_MAX_PAGES + 1):
+                      url = f"{cat['url']}&page={pno}"
+                      await goto(page, url)
+                      cards = await page.evaluate(EXTRACT_JS, r"itemView\.ssg\?itemId=(\d+)")
+                      await save_debug(page, f"ssg_{cat['category']}_{pno}")
+                      new = 0
+                      for c in cards:
+                          pid = "ssg:" + c["id"]
+                          if pid in items:
+                              continue
+                          p = parse_ssg(c["text"], c["title"])
+                          if not p.get("price"):
+                              continue
+                          items[pid] = {
+                              "id": pid, "mall": "ssg", "category": cat["category"],
+                              "name": c["title"], "url": f"https://www.ssg.com/item/itemView.ssg?itemId={c['id']}",
+                              "seller": ssg_seller(c["text"], c["title"]), **p,
+                          }
+                          new += 1
+                      log(f"SSG {cat['category']} p{pno}: 카드 {len(cards)} / 신규 {new}")
+                      if new == 0:
+                          break
+              return items
+
+
+          # ── 그린빈즈 ─────────────────────────────────────────────
+          async def gb_load_all(page):
+              """'もっと見る' 류 버튼 클릭 + 스크롤로 목록을 끝까지 펼친다."""
+              last = -1
+              for _ in range(40):
+                  count = await page.locator("a[href*='/products/'][href$='/details']").count()
+                  if count == last:
+                      break
+                  last = count
+                  await page.mouse.wheel(0, 20000)
+                  await asyncio.sleep(1.5)
+                  for label in ["もっと見る", "さらに表示", "次へ", "もっと読み込む"]:
+                      btn = page.get_by_role("button", name=re.compile(label))
+                      if await btn.count():
+                          try:
+                              await btn.first.click(timeout=3000)
+                              await asyncio.sleep(config.REQUEST_DELAY_SEC)
+                          except Exception:
+                              pass
+
+
+          async def gb_find_miso(page):
+              await goto(page, config.GB_SEASONING_URL)
+              for a in await page.locator("a[href*='sublocationId=']").all():
+                  text = (await a.inner_text()).strip()
+                  if any(text.startswith(t) or text == t for t in config.GB_MISO_LINK_TEXTS):
+                      href = await a.get_attribute("href")
+                      if href:
+                          return href if href.startswith("http") else "https://greenbeans.com" + href
+              return None
+
+
+          async def crawl_gb(page, errors):
+              cats = list(config.GB_CATEGORIES)
+              if not any(c["category"] == "된장" for c in cats):
+                  miso = await gb_find_miso(page)
+                  if miso:
+                      log("그린빈즈 味噌 카테고리 발견:", miso)
+                      cats.append({"category": "된장", "url": miso})
+                  else:
+                      errors.append("그린빈즈 味噌 카테고리를 찾지 못함 — config.GB_CATEGORIES에 URL을 직접 추가하세요")
+              items = {}
+              for cat in cats:
+                  await goto(page, cat["url"])
+                  await gb_load_all(page)
+                  await save_debug(page, f"gb_{cat['category']}")
+                  cards = await page.evaluate(EXTRACT_JS, r"/products/(\d+)/details")
+                  for c in cards:
+                      pid = "gb:" + c["id"]
+                      p = parse_gb(c["text"], c["title"])
+                      if not p.get("price") or pid in items:
+                          continue
+                      items[pid] = {
+                          "id": pid, "mall": "greenbeans", "category": cat["category"],
+                          "name": c["title"], "url": f"https://greenbeans.com/products/{c['id']}/details", **p,
+                      }
+                  log(f"그린빈즈 {cat['category']}: 카드 {len(cards)}")
+              return items
+
+
+          # ── 비교·저장 ────────────────────────────────────────────
+          def load_json(path, default):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  return default
+
+
+          def diff(prev_items, cur_items):
+              prev = {i["id"]: i for i in prev_items}
+              cur = {i["id"]: i for i in cur_items}
+              ch = {"new": [], "removed": [], "price_up": [], "price_down": [], "promo_start": [], "promo_end": []}
+              for pid, it in cur.items():
+                  old = prev.get(pid)
+                  if not old:
+                      ch["new"].append(pid)
+                      continue
+                  if old.get("price") and it.get("price") and old["price"] != it["price"]:
+                      ch["price_up" if it["price"] > old["price"] else "price_down"].append(
+                          {"id": pid, "from": old["price"], "to": it["price"]})
+                  op, np = set(old.get("promos", [])), set(it.get("promos", []))
+                  if np - op:
+                      ch["promo_start"].append({"id": pid, "promos": sorted(np - op)})
+                  if op - np:
+                      ch["promo_end"].append({"id": pid, "promos": sorted(op - np)})
+              ch["removed"] = [{"id": pid, "name": prev[pid].get("name"), "mall": prev[pid].get("mall")}
+                               for pid in prev if pid not in cur]
+              return ch
+
+
+          async def main():
+              started = time.time()
+              today = datetime.now(KST).strftime("%Y-%m-%d")
+              errors = []
+              DATA.mkdir(parents=True, exist_ok=True)
+              prev = load_json(DATA / "latest.json", {"items": []})
+
+              async with async_playwright() as pw:
+                  browser = await pw.chromium.launch()
+                  ctx = await browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 1366, "height": 900})
+                  page = await ctx.new_page()
+                  results = {}
+                  for mall, fn in (("ssg", lambda: crawl_ssg(page)), ("greenbeans", lambda: crawl_gb(page, errors))):
+                      try:
+                          results[mall] = await fn()
+                      except Exception as e:
+                          errors.append(f"{mall} 수집 실패: {e!r}")
+                          results[mall] = {}
+                      if not results[mall]:
+                          # 수집 실패 시 어제 데이터를 지우지 않고 'stale'로 남긴다.
+                          kept = [dict(i, stale=True) for i in prev["items"] if i.get("mall") == mall]
+                          errors.append(f"{mall}: 오늘 0건 — 이전 데이터 {len(kept)}건 유지")
+                          results[mall] = {i["id"]: i for i in kept}
+                  await browser.close()
+
+              items = []
+              for mall_items in results.values():
+                  for it in mall_items.values():
+                      kw = is_excluded(it.get("name", ""))
+                      if kw:
+                          it["excluded"] = kw
+                      items.append(it)
+              items.sort(key=lambda i: (i["mall"], i["category"], i.get("name", "")))
+
+              changes = diff([i for i in prev["items"] if not i.get("stale")], [i for i in items if not i.get("stale")])
+              stats = {m: {"total": sum(1 for i in items if i["mall"] == m and not i.get("excluded")),
+                           "on_promo": sum(1 for i in items if i["mall"] == m and i.get("promos") and not i.get("excluded"))}
+                       for m in ("ssg", "greenbeans")}
+              latest = {"date": today, "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
+                        "duration_sec": round(time.time() - started), "stats": stats, "errors": errors, "items": items}
+
+              (DATA / "daily").mkdir(exist_ok=True)
+              for path, obj in ((DATA / "latest.json", latest), (DATA / "daily" / f"{today}.json", latest),
+                                (DATA / "changes.json", {"date": today, "since": prev.get("date"), **changes})):
+                  path.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+
+              hist = load_json(DATA / "history.json", {})
+              cutoff = (datetime.now(KST) - timedelta(days=config.HISTORY_DAYS)).strftime("%Y-%m-%d")
+              for it in items:
+                  if it.get("stale") or not it.get("price"):
+                      continue
+                  h = [p for p in hist.get(it["id"], []) if p[0] != today and p[0] >= cutoff]
+                  h.append([today, it["price"], 1 if it.get("promos") else 0])
+                  hist[it["id"]] = h
+              (DATA / "history.json").write_text(json.dumps(hist, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+              dates = sorted(set(load_json(DATA / "dates.json", []) + [today]))
+              (DATA / "dates.json").write_text(json.dumps(dates), encoding="utf-8")
+
+              log(f"완료: {len(items)}건, 오류 {len(errors)}건, {latest['duration_sec']}초")
+              for e in errors:
+                  log("  !", e)
+              # 두 몰 모두 실패하면 워크플로가 실패로 표시되도록
+              if all(not any(not i.get("stale") for i in r.values()) for r in results.values()):
+                  sys.exit(1)
+
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          JANGPRICE_EOF
+          mkdir -p docs
+          cat > docs/index.html <<'JANGPRICE_EOF'
+          <!DOCTYPE html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <title>장값 — 간장·된장 일일 가격·행사</title>
+          <link rel="manifest" href="manifest.webmanifest">
+          <meta name="theme-color" content="#4a2618">
+          <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+          <link rel="icon" href="icons/icon-192.png">
+          <meta name="apple-mobile-web-app-capable" content="yes">
+          <meta name="mobile-web-app-capable" content="yes">
+          <meta name="apple-mobile-web-app-title" content="장값">
+          <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;700&family=Noto+Sans+JP:wght@400;500&display=swap" rel="stylesheet">
+          <style>
+          :root{--bg:#f3f2ee;--surface:#fff;--line:#dedad2;--ink:#1f1a17;--muted:#6f665e;--soy:#4a2618;--miso:#b9822a;--ssg:#25588a;--gb:#2f7a4f;--up:#b03a2e;--down:#25588a;--chip:#f6eddc;color-scheme:light}
+          @media (prefers-color-scheme:dark){:root{--bg:#16120f;--surface:#211b17;--line:#3a312a;--ink:#f0ebe5;--muted:#a89d92;--soy:#d9a77f;--miso:#e0aa52;--ssg:#7fb0e0;--gb:#6fc493;--up:#ec7d70;--down:#7fb0e0;--chip:#3a2d1c;color-scheme:dark}}
+          :root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+          *,*::before,*::after{box-sizing:inherit}
+          body{margin:0;background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans KR","Noto Sans JP","Apple SD Gothic Neo",system-ui,sans-serif;font-size:15px;line-height:1.5}
+          .jp{font-family:"Noto Sans JP","Hiragino Sans",sans-serif}
+          .num{font-variant-numeric:tabular-nums}
+          button,input{font:inherit;color:inherit}
+          :focus-visible{outline:2px solid var(--miso);outline-offset:2px}
+          .wrap{max-width:760px;margin:0 auto;padding:0 16px 48px}
+          body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--soy)}
+          header{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--soy);color:#fff7ee}
+          header .wrap{padding-top:12px;padding-bottom:12px}
+          h1{margin:0;font-size:21px;letter-spacing:-.02em}
+          .meta{font-size:12.5px;opacity:.8}
+          .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+          .stat{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--c);border-radius:10px;padding:10px 12px}
+          .stat b{font-size:20px}
+          .stat span{display:block;font-size:12.5px;color:var(--muted)}
+          .warn{background:var(--chip);border-radius:10px;padding:10px 12px;font-size:13px;margin:10px 0}
+          .seg{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--surface)}
+          .seg button{border:0;background:transparent;padding:9px 12px;cursor:pointer;flex:1;white-space:nowrap}
+          .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+          .bar{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+          .search{flex:1 1 100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+          .toggles{display:flex;gap:14px;font-size:13.5px;color:var(--muted);margin:4px 0 10px}
+          .toggles label{display:flex;gap:5px;align-items:center;cursor:pointer}
+          .count{font-size:13px;color:var(--muted);margin:6px 0}
+          ul{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+          li{border-bottom:1px solid var(--line)}
+          li>button{all:unset;display:grid;grid-template-columns:1fr auto;gap:2px 12px;width:100%;padding:12px 2px;cursor:pointer}
+          li>button:focus-visible{outline:2px solid var(--miso)}
+          .nm{font-weight:500}
+          .mall{font-size:11.5px;font-weight:500;color:var(--c);margin-right:6px}
+          .pr{text-align:right;font-weight:700}
+          .sub{font-size:12.5px;color:var(--muted)}
+          .chg{text-align:right;font-size:12.5px}
+          .chg.up{color:var(--up)}.chg.down{color:var(--down)}.chg.new{color:var(--miso)}
+          .chips{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:5px;margin-top:3px}
+          .chip{font-size:11.5px;background:var(--chip);border-radius:6px;padding:1px 7px}
+          .chip.end{text-decoration:line-through;opacity:.7}
+          .empty{padding:32px 6px;text-align:center;color:var(--muted)}
+          .detail{padding:6px 2px 14px;grid-column:1/-1}
+          .detail svg{width:100%;height:120px;display:block}
+          .detail a{color:var(--muted)}
+          .tbl{font-size:12.5px;color:var(--muted);margin-top:6px}
+          section.chgs h2{font-size:15px;margin:18px 0 6px}
+          .install{display:flex;gap:10px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:12px;font-size:13.5px}
+          .install button{margin-left:auto;border:0;border-radius:8px;padding:8px 12px;background:var(--soy);color:#fff7ee;cursor:pointer;flex:none}
+          .install .x{background:transparent;color:var(--muted);margin-left:0;padding:8px}
+          .offline{font-size:12.5px;color:var(--muted)}
+          </style>
+          </head>
+          <body>
+          <header><div class="wrap"><h1>장값</h1><div class="meta" id="meta">불러오는 중…</div></div></header>
+          <main class="wrap"><div id="install"></div><div id="app"></div></main>
+          <script>
+          const MALL={ssg:{name:"쓱닷컴",c:"var(--ssg)"},greenbeans:{name:"그린빈즈",c:"var(--gb)"}};
+          let D=null,H=null,C=null,st={mall:"all",cat:"all",view:"all",q:"",showEx:false,open:null};
+          const app=document.getElementById("app");
+          const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+          const money=(v,cur)=>v==null?"—":cur==="JPY"?"¥"+v.toLocaleString("ja-JP"):v.toLocaleString("ko-KR")+"원";
+
+          async function load(){
+            try{
+              const [l,h,c]=await Promise.all(["latest","history","changes"].map(n=>fetch(`data/${n}.json?t=${Date.now()}`).then(r=>r.ok?r.json():null)));
+              D=l;H=h||{};C=c||{};
+              if(!D||!D.items){app.innerHTML=`<div class="empty">아직 수집된 데이터가 없어요. GitHub Actions에서 daily-crawl을 한 번 실행하세요.</div>`;document.getElementById("meta").textContent="데이터 없음";return;}
+              document.getElementById("meta").textContent=`${D.date} 수집 (${D.generated_at.slice(11,16)} KST)`;
+              render();
+            }catch(e){app.innerHTML=`<div class="empty">데이터를 불러오지 못했어요. 페이지를 새로고침하세요.</div>`;}
+          }
+
+          function changeOf(id){
+            if(!C)return null;
+            const f=(k)=>(C[k]||[]).find(x=>(x.id||x)===id);
+            let x;
+            if(x=f("price_up"))return{cls:"up",t:`▲ ${money(x.to-x.from,curOf(id))}`};
+            if(x=f("price_down"))return{cls:"down",t:`▼ ${money(x.from-x.to,curOf(id))}`};
+            if(f("new"))return{cls:"new",t:"신규"};
+            return null;
+          }
+          const curOf=id=>id.startsWith("gb:")?"JPY":"KRW";
+          const promoStarted=id=>(C?.promo_start||[]).find(x=>x.id===id)?.promos||[];
+          const promoEnded=id=>(C?.promo_end||[]).find(x=>x.id===id)?.promos||[];
+
+          function spark(id){
+            const h=(H[id]||[]);
+            if(h.length<2)return `<p class="tbl">가격 이력이 쌓이면 그래프가 표시돼요 (현재 ${h.length}일).</p>`;
+            const w=600,ht=110,p=8,vs=h.map(x=>x[1]),mn=Math.min(...vs),mx=Math.max(...vs),rg=mx-mn||1;
+            const pts=h.map((x,i)=>[p+i*(w-2*p)/(h.length-1),ht-p-(x[1]-mn)/rg*(ht-2*p)]);
+            return `<svg viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" role="img" aria-label="가격 추이">
+              <polyline fill="none" stroke="var(--soy)" stroke-width="2" points="${pts.map(q=>q.join(",")).join(" ")}"/>
+              ${pts.map((q,i)=>h[i][2]?`<circle cx="${q[0]}" cy="${q[1]}" r="3.5" fill="var(--miso)"/>`:"").join("")}
+            </svg><p class="tbl num">${h[0][0]} ~ ${h[h.length-1][0]} | 최저 ${money(mn,curOf(id))} | 최고 ${money(mx,curOf(id))} | 주황 점 = 행사 중이던 날</p>`;
+          }
+
+          function render(){
+            const q=st.q.trim().toLowerCase();
+            let items=D.items.filter(i=>(st.showEx||!i.excluded)&&(st.mall==="all"||i.mall===st.mall)&&(st.cat==="all"||i.category===st.cat)&&(!q||[i.name,i.seller].join(" ").toLowerCase().includes(q)));
+            if(st.view==="promo")items=items.filter(i=>i.promos&&i.promos.length);
+            if(st.view==="chg")items=items.filter(i=>changeOf(i.id)||promoStarted(i.id).length||promoEnded(i.id).length);
+            const s=D.stats||{};
+            let html=`<div class="stats">${Object.entries(MALL).map(([k,m])=>`<div class="stat" style="--c:${m.c}"><b class="num">${s[k]?.total??0}</b> <span>${m.name} 상품 | 행사 중 ${s[k]?.on_promo??0}</span></div>`).join("")}</div>`;
+            if(D.errors&&D.errors.length)html+=`<div class="warn">수집 경고: ${D.errors.map(esc).join(" / ")}</div>`;
+            const removed=(C?.removed||[]);
+            html+=`<div class="bar">
+              <input class="search" type="search" id="q" placeholder="상품명·판매자 검색" value="${esc(st.q)}">
+              <div class="seg" role="group" aria-label="몰">${[["all","전체"],["ssg","쓱닷컴"],["greenbeans","그린빈즈"]].map(([v,l])=>`<button data-k="mall" data-v="${v}" aria-pressed="${st.mall===v}">${l}</button>`).join("")}</div>
+              <div class="seg" role="group" aria-label="분류">${[["all","전체"],["간장","간장"],["된장","된장"]].map(([v,l])=>`<button data-k="cat" data-v="${v}" aria-pressed="${st.cat===v}">${l}</button>`).join("")}</div>
+              <div class="seg" role="group" aria-label="보기">${[["all","모든 상품"],["promo","행사 중"],["chg","오늘 변동"]].map(([v,l])=>`<button data-k="view" data-v="${v}" aria-pressed="${st.view===v}">${l}</button>`).join("")}</div>
+            </div>
+            <div class="toggles"><label><input type="checkbox" id="ex" ${st.showEx?"checked":""}> 비대상 상품(쯔유·폰즈 등) 보기</label></div>
+            <p class="count num">${items.length}개 표시${C?.since?` | 변동 기준: ${C.since} 대비`:""}</p>`;
+            if(!items.length)html+=`<div class="empty">조건에 맞는 상품이 없어요. 필터를 바꿔 보세요.</div>`;
+            else html+=`<ul>${items.map(i=>{
+              const m=MALL[i.mall],ch=changeOf(i.id),started=promoStarted(i.id),ended=promoEnded(i.id),open=st.open===i.id;
+              const chips=[...(i.promos||[]).map(p=>`<span class="chip">${started.includes(p)?"NEW ":""}${esc(p)}</span>`),...ended.map(p=>`<span class="chip end">${esc(p)}</span>`)].join("");
+              return `<li><button data-open="${esc(i.id)}" aria-expanded="${open}">
+                <span><span class="mall" style="--c:${m.c}">${m.name}</span><span class="nm ${i.mall==="greenbeans"?"jp":""}">${esc(i.name)}</span></span>
+                <span class="pr num">${money(i.price,i.currency)}</span>
+                <span class="sub">${[i.category,i.size,i.seller,i.price_regular?`정상가 ${money(i.price_regular,i.currency)}`:"",i.stale?"오늘 미수집":"",i.excluded?"비대상":""].filter(Boolean).map(esc).join(" | ")}</span>
+                <span class="chg num ${ch?.cls||""}">${ch?esc(ch.t):""}</span>
+                ${chips?`<span class="chips">${chips}</span>`:""}
+                </button>${open?`<div class="detail">${spark(i.id)}<p class="tbl">${i.unit_price?esc(i.unit_price)+" | ":""}${i.rating?`평점 ${i.rating}${i.reviews?` (${i.reviews})`:""} | `:""}<a href="${esc(i.url)}" target="_blank" rel="noopener">상품 페이지 열기</a></p></div>`:""}</li>`;
+            }).join("")}</ul>`;
+            if(removed.length&&st.view==="chg")html+=`<section class="chgs"><h2>사라진 상품 ${removed.length}개</h2><ul>${removed.map(r=>`<li><div style="padding:10px 2px"><span class="mall" style="--c:${MALL[r.mall]?.c}">${MALL[r.mall]?.name||""}</span>${esc(r.name)}</div></li>`).join("")}</ul></section>`;
+            app.innerHTML=html;
+            const qe=document.getElementById("q");
+            qe.oninput=e=>{st.q=e.target.value;const p=e.target.selectionStart;render();const n=document.getElementById("q");n.focus();n.setSelectionRange(p,p);};
+            app.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>{st[b.dataset.k]=b.dataset.v;render();});
+            app.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>{st.open=st.open===b.dataset.open?null:b.dataset.open;render();});
+            document.getElementById("ex").onchange=e=>{st.showEx=e.target.checked;render();};
+          }
+          load();
+
+          // ── 앱 설치(홈 화면에 추가) ──
+          if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(()=>{});
+          const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+          let dismissed = false; try { dismissed = localStorage.getItem("installDismissed") === "1"; } catch(e){}
+          const box = document.getElementById("install");
+          function hideInstall(){ box.innerHTML=""; try{localStorage.setItem("installDismissed","1");}catch(e){} }
+          let deferred = null;
+          window.addEventListener("beforeinstallprompt", e => {
+            e.preventDefault(); deferred = e;
+            if (standalone || dismissed) return;
+            box.innerHTML = `<div class="install"><span>장값을 앱으로 설치하면 홈 화면에서 바로 열 수 있어요.</span><button id="inst">설치</button><button class="x" id="instx" aria-label="닫기">✕</button></div>`;
+            document.getElementById("inst").onclick = async () => { deferred.prompt(); await deferred.userChoice; hideInstall(); };
+            document.getElementById("instx").onclick = hideInstall;
+          });
+          if (!standalone && !dismissed && /iphone|ipad|ipod/i.test(navigator.userAgent)) {
+            box.innerHTML = `<div class="install"><span>앱으로 쓰려면 Safari 하단의 공유 버튼 → ‘홈 화면에 추가’를 누르세요.</span><button class="x" id="instx" aria-label="닫기">✕</button></div>`;
+            document.getElementById("instx").onclick = hideInstall;
+          }
+          window.addEventListener("offline", () => { const m=document.getElementById("meta"); if(m && !m.textContent.includes("오프라인")) m.textContent += " | 오프라인: 마지막 데이터 표시 중"; });
+          </script>
+          </body>
+          </html>
+          JANGPRICE_EOF
+          mkdir -p docs
+          cat > docs/sw.js <<'JANGPRICE_EOF'
+          // 앱 화면은 캐시해 두고(오프라인에서도 열림), 데이터는 항상 최신을 먼저 시도한다.
+          const SHELL = "jangprice-shell-v1";
+          const DATA = "jangprice-data";
+          const SHELL_FILES = ["./", "index.html", "manifest.webmanifest", "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
+
+          self.addEventListener("install", e => {
+            e.waitUntil(caches.open(SHELL).then(c => c.addAll(SHELL_FILES)).then(() => self.skipWaiting()));
+          });
+          self.addEventListener("activate", e => {
+            e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== SHELL && k !== DATA).map(k => caches.delete(k))))
+              .then(() => self.clients.claim()));
+          });
+          self.addEventListener("fetch", e => {
+            const url = new URL(e.request.url);
+            if (e.request.method !== "GET" || url.origin !== location.origin) return;
+            if (url.pathname.includes("/data/")) {
+              // 네트워크 우선 → 실패하면 마지막으로 받은 데이터
+              const key = url.origin + url.pathname;
+              e.respondWith(fetch(e.request).then(r => {
+                if (r.ok) { const copy = r.clone(); caches.open(DATA).then(c => c.put(key, copy)); }
+                return r;
+              }).catch(() => caches.match(key).then(r => r || new Response("null", {headers: {"Content-Type": "application/json"}}))));
+              return;
+            }
+            e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+          });
+          JANGPRICE_EOF
+          mkdir -p docs
+          cat > docs/manifest.webmanifest <<'JANGPRICE_EOF'
+          {
+            "name": "장값 — 간장·된장 가격·행사",
+            "short_name": "장값",
+            "description": "쓱닷컴·그린빈즈 간장·된장 전 상품의 매일 가격과 행사",
+            "lang": "ko",
+            "start_url": "./",
+            "scope": "./",
+            "display": "standalone",
+            "background_color": "#f3f2ee",
+            "theme_color": "#4a2618",
+            "icons": [
+              {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+              {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+            ]
+          }
+          JANGPRICE_EOF
+
+      - name: Install tools
+        run: |
+          pip install playwright==1.47.0 pillow
+          python -m playwright install --with-deps chromium
+          sudo apt-get install -y -q fonts-noto-cjk >/dev/null || true
+
+      - name: Make app icons
+        run: |
+          python - <<'JANGPRICE_EOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import glob, os
+          os.makedirs("docs/icons", exist_ok=True)
+          fonts = glob.glob("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc") + glob.glob("/usr/share/fonts/**/*CJK*Bold*", recursive=True)
+          for size, name in ((192, "icon-192.png"), (512, "icon-512.png"), (180, "apple-touch-icon.png")):
+              im = Image.new("RGB", (size, size), "#4a2618")
+              d = ImageDraw.Draw(im)
+              c, r = size / 2, size * 0.405
+              d.ellipse([c - r, c - r, c + r, c + r], fill="#b9822a")
+              if fonts:
+                  f = ImageFont.truetype(fonts[0], int(size * 0.42))
+                  b = d.textbbox((0, 0), "장", font=f)
+                  d.text((c - (b[2] - b[0]) / 2 - b[0], c - (b[3] - b[1]) / 2 - b[1]), "장", font=f, fill="#fff7ee")
+              im.save("docs/icons/" + name)
+          JANGPRICE_EOF
+
+      - name: Parser self-test
+        run: cd crawler && python test_parsers.py
+
+      - name: Crawl
+        run: python crawler/crawl.py --debug
+
+      - name: Upload debug pages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Save app and data
+        if: always()
+        run: |
+          touch docs/.nojekyll
+          git config user.name "jangprice-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "data: $(TZ=Asia/Seoul date +%F)"
+          git push
