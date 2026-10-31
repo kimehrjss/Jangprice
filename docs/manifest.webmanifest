@@ -1,0 +1,15 @@
+{
+  "name": "장값 — 간장·된장 가격·행사",
+  "short_name": "장값",
+  "description": "쓱닷컴·그린빈즈 간장·된장 전 상품의 매일 가격과 행사",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f2ee",
+  "theme_color": "#4a2618",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
