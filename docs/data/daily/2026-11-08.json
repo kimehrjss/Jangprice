@@ -1,0 +1,20 @@
+{
+ "date": "2026-11-08",
+ "generated_at": "2026-11-08T06:29:53+09:00",
+ "duration_sec": 44,
+ "stats": {
+  "ssg": {
+   "total": 0,
+   "on_promo": 0
+  },
+  "greenbeans": {
+   "total": 0,
+   "on_promo": 0
+  }
+ },
+ "errors": [
+  "ssg: 오늘 0건 — 이전 데이터 0건 유지",
+  "greenbeans: 오늘 0건 — 이전 데이터 0건 유지"
+ ],
+ "items": []
+}
